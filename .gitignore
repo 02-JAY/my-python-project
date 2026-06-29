@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# 忽略 IntelliJ 的 IDE 設定檔
+.idea/
+*.iml
+
+# 忽略含有金鑰的環境變數檔案
+env.json.txt
+.env
+
 # C extensions
 *.so
 
