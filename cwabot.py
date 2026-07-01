@@ -4,6 +4,10 @@ import json
 import time
 import tempfile
 from copy import deepcopy
+import base64
+
+import threading  # 引入執行緒模組
+from langchain_core.messages import HumanMessage  #  引入 LangChain 多模態訊息格式
 
 from flask import Flask, request, abort
 
@@ -568,27 +572,69 @@ def speech_to_text(gcs_uri: str) -> str:
 
     return response.results[0].alternatives[0].transcript
 
+def bg_upload_to_gcs(bucket_name, blob_name, content, content_type):
+    """
+    【線下任務】在背景默默上傳音檔至 GCS，不卡住使用者的 LINE 回覆時間
+    """
+    try:
+        # 使用原本設定好的儲存媒介與環境金鑰
+        client = storage.Client.from_service_account_json('keycloud.json')
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        blob.upload_from_string(content, content_type=content_type)
+        print(f"============== [GCS 備份成功] 檔案已存至: {blob_name} ==============")
+    except Exception as e:
+        print(f"============== [GCS 備份失敗] 錯誤原因: {e} ==============")
+
 @handler.add(MessageEvent, message=AudioMessageContent)
 def handle_audio_message(event):
     userid = event.source.user_id
 
     with ApiClient(configuration) as api_client:
         try:
-            raw_audio = download_line_audio(event, api_client)
-            print(f'raw_audio = {raw_audio}')
-            wav_audio = upload_audio_to_gcs(event, raw_audio)
+            # 1. 下載音檔二進位內容
+            blob_api = MessagingApiBlob(api_client)
+            content = blob_api.get_message_content(event.message.id)
 
-            text = speech_to_text(wav_audio)
-            print(f'text = {text}')
+            # 2. 【線下任務】背景執行緒上傳 GCS
+            blob_name = f"audio-files/{userid}_{event.message.id}.ogg"
+            upload_thread = threading.Thread(
+                target=bg_upload_to_gcs,
+                args=('jay25499', blob_name, content, 'audio/ogg')
+            )
+            upload_thread.start()
+
+            # 🚀 3. 【修正重點】將 Binary 轉成 Base64 字串，用標準 image_url 格式餵給 LangChain
+            audio_base64 = base64.b64encode(content).decode('utf-8')
+
+            whisper_prompt = "你是一個精準的語音聽寫員。請把這段語音盲聽並翻譯成繁體中文文字，不要回答任何多餘的解釋、標點符號或問候，只需輸出聽到的文字。如果沒聲音或聽不懂，請輸出 '無法辨識'。"
+
+            # 使用 LangChain 通用的多模態結構 (通用於圖片與音訊)
+            hearing_message = HumanMessage(
+                content=[
+                    {"type": "text", "text": whisper_prompt},
+                    {
+                        "type": "image_url",  # 註：部分 LangChain 版本語音也包在 image_url 格式內傳送 Base64
+                        "image_url": {"url": f"data:audio/ogg;base64,{audio_base64}"}
+                    }
+                ]
+            )
+
+            speech_result = llm.invoke([hearing_message])
+            text = speech_result.content.strip()
+            print(f'===[Gemini 語音辨識結果]===: {text}')
+
+            # 4. 判斷辨識結果並呼叫既有的天氣 Agent
+            if not text or "無法辨識" in text:
+                ans = "我沒有聽清楚，可以再說一次嗎？"
+            else:
+                ans = ask_weather(userid, text)
+
         except Exception as e:
-            print("語音處理失敗:", e)
-            text = ""
+            print("語音處理發生未預期錯誤:", e)
+            ans = "語音系統開小差了，請稍後再試。"
 
-        if not text:
-            ans = "我沒有聽清楚，可以再說一次嗎？"
-        else:
-            ans = ask_weather(userid, text)
-
+        # 5. 快速回覆給 LINE 使用者
         MessagingApi(api_client).reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
