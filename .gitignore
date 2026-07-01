@@ -9,7 +9,9 @@ __pycache__/
 
 # 忽略含有金鑰的環境變數檔案
 env.json.txt
+keycloud.json
 .env
+.venv/
 
 # C extensions
 *.so
