@@ -5,9 +5,14 @@ import time
 import tempfile
 from copy import deepcopy
 import base64
+from typing import Optional, Literal
+from langchain.tools import tool  # 或是你原本使用的 tool 裝飾器套件
 
 import threading  # 引入執行緒模組
 from langchain_core.messages import HumanMessage  #  引入 LangChain 多模態訊息格式
+
+import requests
+from langchain_core.tools import tool
 
 from flask import Flask, request, abort
 
@@ -87,6 +92,76 @@ llm = ChatGoogleGenerativeAI(
 #llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash', vertexai=True, location='global')
 geolocator = Nominatim(user_agent = 'user_agent',timeout = 5)
 
+# 改成你 Controller 訂好的 V1 API 路徑
+SPRING_BOOT_RECOMMEND_URL = "http://localhost:8080/api/v1/bot/products/recommendations"
+
+@tool
+def recommend_ecommerce_products(keyword: Optional[str] = None, category: Optional[str] = None) -> str:
+    """
+    當使用者想要搜尋、推薦或尋找電商商品時，呼叫此工具。
+    AI 必須根據使用者的輸入，自動、廣泛地推論出最合理的商品分類（category 絕對不能為 None）。
+
+    參數說明:
+    - keyword: 從對話中提取的核心搜尋字（如品牌、型號、公升數、功效或氣味）。
+    - category: AI 應展現領域常識，根據以下泛化原則『三選一』填入（不可為空）：
+
+        * 'FRAGRANCE_PACK' (香氛防潮類) :
+          只要關鍵字涉及「氣味/植物/精油」（如：薰衣草、玫瑰、薄荷、小蒼蘭）
+          或涉及「消耗型防潮小物」（如：香包、除濕袋、克潮靈、竹炭包、乾燥劑），一律歸為此類。
+
+        * 'DEHUMIDIFIER' (除濕機家電類) :
+          只要關鍵字涉及「知名家電品牌」（如：Panasonic、日立、Hitachi、三菱、SHARP、Muji）
+          或涉及「電器規格/專有名詞」（如：6L、11L、變頻、壓縮機、水箱、坪數、套房用電器），一律歸為此類。
+
+        * 'DRY_BOX' (電子防潮箱類) :
+          外觀為箱體、涉及「精密儀器/攝影保存」或明確提到「防潮箱、電子箱、相機收藏箱」時歸為此類。
+
+    [自動推論指引] AI 應靈活判斷語意。若使用者僅輸入『日立 6L』，雖未明說，但根據常理，具備公升數的日立產品必為除濕機家電，應自動判定 category='DEHUMIDIFIER'。
+    """
+    try:
+        # 組裝 Query Parameters
+        params = {}
+        if keyword: params["keyword"] = keyword
+        if category: params["category"] = category
+
+        response = requests.get(SPRING_BOOT_RECOMMEND_URL, params=params, timeout=5)
+
+        if response.status_code == 200:
+            products = response.json()
+
+            # 判斷回傳是否為空清單，或是根本不是 list
+            if not products or not isinstance(products, list):
+                return "目前找不到符合推薦條件的商品。"
+
+            # 🌟 關鍵改動：只撈取後端回傳的第一筆商品 (Index 0)
+            p = products[0]
+
+            # 安全讀取 productSpec (防止 Java 傳回 null 導致 Python 的 get() 崩潰)
+            spec = p.get('productSpec')
+            if not isinstance(spec, dict):
+                spec = {}
+
+            # 取得個性花語，若無則預設為通用
+            personality_desc = spec.get('personality', '通用')
+
+            # 組裝單一商品的漂亮回傳格式
+            result_text = "💡 為您找到最符合的精選商品：\n"
+            result_text += f"📦 商品: {p.get('productName', '未命名商品')}\n"
+            result_text += f"💰 價格: {p.get('price', 0)} 元\n"
+            result_text += f"✨ 適合性格: {personality_desc}\n"
+
+            img_url = p.get('imageUrl', '').strip() if p.get('imageUrl') else ''
+            if img_url:
+                result_text += f"🔗 圖片: {img_url}\n"
+            result_text += "------------------\n"
+
+            return result_text
+
+        return f"商品推薦系統忙碌中（狀態碼: {response.status_code}）。"
+    except Exception as e:
+        # 這裡保留精確的 Exception 訊息，方便你噴錯時看 Terminal 抓漏
+        return f"連線至推薦模組異常，原因: {str(e)}"
+
 @tool
 def get_weather_by_coordinates(latitude: float, longitude: float) -> str:
     '''get weather info by coordinates'''
@@ -111,10 +186,19 @@ def get_weather_by_location(location:str) -> str:
     info = cwa.cwa2(location,env['CWA_KEY'])
     return cwa.tostr(info) if info else '無此站'
 
-tools = [get_weather_by_coordinates,get_coordinates,get_weather_by_location]
+tools = [
+    get_weather_by_coordinates,
+    get_coordinates,
+    get_weather_by_location,
+    recommend_ecommerce_products  # 推薦商品
+]
 
+# 2. 放寬系統提示詞，讓 AI 知道除了天氣，他也能處理電商推薦
 system_prompt = '''
-你喜歡用繁體中文聊天氣，並且能用工具查詢真實天氣，若遇到失敗會查詢其他方法。對其他方法愛莫能助，不准回答查不到結果
+你是一個貼心的生活助手，擅長使用繁體中文回答問題。
+1. 如果使用者詢問天氣，請使用天氣相關工具查詢真實天氣。
+2. 如果使用者想找商品、需要推薦、或是詢問購物相關問題，請使用商品推薦工具 (recommend_ecommerce_products)。
+請根據使用者的意圖靈活切換工具，若查不到結果，請委婉告知並引導使用者換個說法。
 '''
 
 agent = create_agent(model=llm,tools= tools,system_prompt=system_prompt)
