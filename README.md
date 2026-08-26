@@ -1,2 +1,2 @@
-# my-python-project
+# mall-assistant-bot
 line robot
