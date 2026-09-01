@@ -1,15 +1,42 @@
-import requests
+from datetime import datetime
 import json
-with open('env.json.txt', encoding='utf-8') as f:
-    env = json.load(f)
+import requests
 
 URLS = [
     'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001',
     'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001'
 ]
+
 _sitemaps = {}
 
-def _load_sitemaps(key):
+def _parse_coordinates(raw_station: dict):
+    """安全解析測站經緯度（優先尋找 WGS84 座標）"""
+    try:
+        coords = raw_station.get('GeoInfo', {}).get('Coordinates', [])
+        if not coords:
+            return None, None
+
+        # 若有多組座標，通常第 2 組為 WGS84，若無則取第 1 組
+        target_coord = coords[1] if len(coords) > 1 else coords[0]
+        lat = float(target_coord.get('StationLatitude'))
+        lon = float(target_coord.get('StationLongitude'))
+        return lat, lon
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None, None
+
+def _format_obs_time(iso_time_str: str) -> str:
+    """處理氣象署 ISO 時間字串，移除 +08:00 並轉為易讀格式"""
+    if not iso_time_str:
+        return "未知時間"
+    try:
+        # 解析如 2026-09-01T19:00:00+08:00
+        dt = datetime.fromisoformat(iso_time_str)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        # Fallback: 若版本不支援 fromisoformat，進行字串取代
+        return iso_time_str.replace("T", " ").split("+")[0]
+
+def _load_sitemaps(key: str) -> dict:
     sitemaps = {}
     params = {'Authorization': key}
 
@@ -17,149 +44,134 @@ def _load_sitemaps(key):
         try:
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
+            data = r.json().get('records', {}).get('Station', [])
         except Exception as e:
-            print(f" {url} 請求失敗：{e.__class__.__name__}")
-            continue
-
-        data = r.json().get('records', {}).get('Station', [])
-        if not data:
-            print(f" {url} 沒有回傳任何 Station 資料")
+            print(f"[CWA] {url} 載入失敗：{e.__class__.__name__}")
             continue
 
         for raw in data:
             name = raw.get('StationName')
-            if not name:
+            if not name or name in sitemaps:
                 continue
 
-            # 取經緯度（依你給的寫法用 Coordinates[1]）
-            lat = lon = None
-            try:
-                coords = raw.get('GeoInfo', {}).get('Coordinates', [])
-                if len(coords) > 1:
-                    lat = float(coords[1]['StationLatitude'])
-                    lon = float(coords[1]['StationLongitude'])
-            except (KeyError, TypeError, ValueError):
-                # 如果某站沒有經緯度或格式怪怪的，就先略過經緯度（保留為 None）
-                pass
+            lat, lon = _parse_coordinates(raw)
+            sitemaps[name] = {
+                'url': url,
+                'lat': lat,
+                'lon': lon
+            }
 
-            # 優先保留第一個找到的 API
-            if name not in sitemaps:
-                sitemaps[name] = {
-                    'url': url,
-                    'lat': lat,
-                    'lon': lon,
-                }
-
-    print('裝完資料了')
+    print(f"[CWA] 測站清單加載完成，共計 {len(sitemaps)} 站")
     return sitemaps
 
+def _cwa(url: str, site: str, key: str) -> dict:
+    params = {'Authorization': key, 'StationName': site}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        if r.status_code != 200:
+            return {}
 
-def cwa2(site, key):
+        stations = r.json().get('records', {}).get('Station', [])
+        if not stations:
+            return {}
+
+        raw = stations[0]
+        s = raw.get('StationName', site)
+
+        # 1. 時間處理（去除時區後綴）
+        raw_time = raw.get('ObsTime', {}).get('DateTime', '')
+        o = _format_obs_time(raw_time)
+
+        # 2. 座標安全提取
+        c = _parse_coordinates(raw)
+
+        # 3. 氣象數據與防呆處理（-99 代表儀器故障/無資料）
+        weather_elem = raw.get('WeatherElement', {})
+
+        # 雨量
+        precip = weather_elem.get('Now', {}).get('Precipitation')
+        r_val = float(precip) if precip is not None and float(precip) >= 0 else 0.0
+
+        # 溫度
+        temp = weather_elem.get('AirTemperature')
+        t_val = float(temp) if temp is not None and float(temp) > -50 else None
+
+        # 濕度
+        humid = weather_elem.get('RelativeHumidity')
+        h_val = (float(humid) / 100) if humid is not None and float(humid) >= 0 else None
+
+        return {
+            'S': s,
+            'O': o,
+            'C': c,
+            'R': r_val,
+            'T': t_val,
+            'H': h_val
+        }
+    except Exception as e:
+        print(f"[CWA] 解析測站 {site} 異常: {e}")
+        return {}
+
+def cwa2(site: str, key: str) -> dict:
     global _sitemaps
     if not _sitemaps:
         _sitemaps = _load_sitemaps(key)
 
     meta = _sitemaps.get(site)
     if meta:
-        url = meta['url']
-        return _cwa(url, site, key)
-    return {}
+        return _cwa(meta['url'], site, key)
 
-def cwa(site,key):
-    #info = _cwa(URLS[0],site,key)
-    #if info:
-    #    return info
-    #return _cwa(URLS[1],site,key)
-
-    #return _cwa(URLS[0],site,key) or _cwa(URLS[1],site,key)
-
+    # 若在 sitemaps 沒精準命中，依序對各 URL 查詢
     for url in URLS:
-        info = _cwa(url,site,key)
+        info = _cwa(url, site, key)
         if info:
             return info
     return {}
 
-def _cwa(url,site,key):
-    params = {'Authorization' : key,
-              'StationName' : site}
-    try:
-        r = requests.get(url,params = params)
-    except Exception as e:
-        print(e.__class__.__name__)
-        return {}
+def cwa(site: str, key: str) -> dict:
+    """相容舊介面，直接調用 cwa2"""
+    return cwa2(site, key)
 
-    if r.status_code != 200:
-        print(r.text)
-        return{}
-    if not r.json()['records']['Station']:
-        return {}
+def tostr(info_dict: dict, sep: str = ', ') -> str:
+    if not info_dict:
+        return ""
 
-    raw = r.json()['records']['Station'][0]
-    s = raw['StationName']
-    o = raw['ObsTime']['DateTime']
-    c =(float(raw['GeoInfo']['Coordinates'][1]['StationLatitude']),
-        float(raw['GeoInfo']['Coordinates'][1]['StationLongitude']))
-    _r = float(raw['WeatherElement']['Now']['Precipitation'])
-    t = float(raw['WeatherElement']['AirTemperature'])
-    h = float(raw['WeatherElement']['RelativeHumidity']) / 100
-
-    info = {'S':s ,'O':o,'C':c,'R':_r,'T':t,'H':h}
-    return info
-
-def tostr(info_dict, sep=', '):
     buf = []
-    if 'S' in info_dict:
+    if info_dict.get('S'):
         buf.append(f"測站: {info_dict['S']}")
-    if 'C' in info_dict:
-        buf.append(f"座標: {info_dict['C']}")
-    if 'O' in info_dict:
+    if info_dict.get('O'):
         buf.append(f"時間: {info_dict['O']}")
-    if 'T' in info_dict:
-        buf.append(f"溫度: {info_dict['T']}度")
-    if 'H' in info_dict:
+    if info_dict.get('T') is not None:
+        buf.append(f"氣溫: {info_dict['T']}°C")
+    if info_dict.get('H') is not None:
         buf.append(f"濕度: {info_dict['H']:.0%}")
-    if 'R' in info_dict:
-        buf.append(f"雨量: {info_dict['R']}mm")
+    if info_dict.get('R') is not None:
+        buf.append(f"時雨量: {info_dict['R']}mm")
+
     return sep.join(buf)
 
-def find_nearest_station(coord, key):
-    """
-    coord: (lat, lon) 的 tuple 或 list
-    key:   CWA_KEY
-
-    回傳: 最近測站的 info dict，格式跟 cwa()/cwa2 一樣：
-          {'S':..., 'O':..., 'C':(...,...), 'R':..., 'T':..., 'H':...}
-    """
+def find_nearest_station(coord: tuple, key: str) -> dict:
+    """根據經緯度搜尋最近測站"""
     global _sitemaps
-
-    # 如果還沒載入測站資料，就載一次
     if not _sitemaps:
         _sitemaps = _load_sitemaps(key)
 
-    # 這一行很重要：把 (lat, lon) 拆成兩個 float
     user_lat, user_lon = coord
-
-    buf = {}
-    min_dist = float("inf")   # 初始設成無限大
+    min_dist = float("inf")
     nearest_name = None
 
     for name, meta in _sitemaps.items():
         lat = meta.get("lat")
         lon = meta.get("lon")
-
-        # 沒經緯度就跳過
         if lat is None or lon is None:
             continue
 
-        # 平面距離，用平方就好，不用開根號
         dist_sq = (user_lat - lat) ** 2 + (user_lon - lon) ** 2
-
         if dist_sq < min_dist:
             min_dist = dist_sq
             nearest_name = name
 
-    if nearest_name is None:
+    if not nearest_name:
         return {}
 
-    # 這裡直接回傳完整 info（S,O,C,R,T,H）
     return cwa2(nearest_name, key)
